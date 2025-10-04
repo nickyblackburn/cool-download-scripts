@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PawTagger FAST (bulk) — tags existing MP3/M4A by playlist index.
-# - No media downloads, no renaming
-# - Single playlist fetch (with fallbacks), then BULK metadata fetch
-# - Caches results in .pawtag_cache.json
+# PawTagger FAST (chunked bulk) — tags existing MP3/M4A from a YouTube playlist.
+# - No media downloads, no renaming of files
+# - Playlist mapping with fallbacks; BULK metadata fetch in chunks
+# - Per-chunk timeout, multiple client fallbacks, cookies→no-cookies fallback
+# - Caches results in .pawtag_cache.json for near-instant reruns
 #
 # Usage:
 #   ./pawtag.sh --folder "yt_downloaded" \
 #               --playlist "https://www.youtube.com/playlist?list=XXXX" \
 #               [--album "YouTube: My Mix"] [--no-cover] [--no-year] [--dry-run] \
 #               [--ff-profile "/path/to/firefox/profile"] [--ytdlp "./bin/yt-dlp"]
+#
+# Tuning (optional env vars):
+#   PAWTAG_CHUNK_SIZE=20      # URLs per yt-dlp call
+#   PAWTAG_CHUNK_TIMEOUT=40   # seconds per chunk
+#   PAWTAG_SOCKET_TIMEOUT=15  # yt-dlp per-request socket timeout
+#   PAWTAG_RETRIES=1          # yt-dlp retries per item
 
+# ---------- pretty logs ----------
 BOLD="\033[1m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
 say(){ printf "%b\n" "$*${RESET}"; }
 
+# ---------- args ----------
 FOLDER=""
 PLAYLIST=""
 FF_PROFILE_DEFAULT="$(printf "%s" "$HOME/snap/firefox/common/.mozilla/firefox"/*default* 2>/dev/null || true)"
@@ -37,8 +46,8 @@ while [ $# -gt 0 ]; do
     --dry-run)    DRY=1; shift;;
     -h|--help)
       cat <<EOF
-${BOLD}PawTagger FAST (bulk)${RESET}
-Tags existing MP3/M4A files by playlist index using BULK metadata fetch.
+${BOLD}PawTagger FAST (chunked bulk)${RESET}
+Tags existing MP3/M4A files by playlist index using chunked BULK metadata fetch.
 
 Required:
   --folder <dir>        Folder with files like '001 - Title.mp3'
@@ -51,6 +60,12 @@ Options:
   --dry-run             Log actions; don't write tags
   --ff-profile <dir>    Firefox profile for cookies (default: $FF_PROFILE)
   --ytdlp <path>        Path to yt-dlp (default: $YTDLP; auto-downloads)
+
+Tuning via env:
+  PAWTAG_CHUNK_SIZE (default 20)
+  PAWTAG_CHUNK_TIMEOUT (default 40)
+  PAWTAG_SOCKET_TIMEOUT (default 15)
+  PAWTAG_RETRIES (default 1)
 EOF
       exit 0;;
     *) say "${YELLOW}Unknown arg:${RESET} $1"; exit 1;;
@@ -68,7 +83,7 @@ say "🍪 ${BOLD}Firefox:${RESET}  $FF_PROFILE"
 say "🧰 ${BOLD}yt-dlp:${RESET}    $YTDLP"
 say "⚙️  Cover: $([ $NO_COVER -eq 1 ] && echo off || echo on) | Year: $([ $NO_YEAR -eq 1 ] && echo off || echo on) | Dry: $([ $DRY -eq 1 ] && echo True || echo False)"
 
-# Ensure yt-dlp
+# ---------- ensure yt-dlp ----------
 if [ ! -x "$YTDLP" ]; then
   say "⬇️  Fetching latest yt-dlp to ${YTDLP}…"
   mkdir -p "$(dirname "$YTDLP")"
@@ -82,13 +97,13 @@ if [ ! -x "$YTDLP" ]; then
   chmod +x "$YTDLP"
 fi
 
-# Ensure mutagen
+# ---------- ensure mutagen ----------
 if ! python3 -c 'import mutagen' >/dev/null 2>&1; then
   say "📦 Installing Python 'mutagen'…"
   python3 -m pip install --user mutagen >/dev/null
 fi
 
-# Run the tagger (bulk)
+# ---------- run the tagger (Python) ----------
 python3 - "$FOLDER" "$PLAYLIST" "$YTDLP" "$FF_PROFILE" "$ALBUM_OVERRIDE" "$NO_COVER" "$NO_YEAR" "$DRY" <<'PY'
 import sys, json, subprocess, tempfile, os, re, urllib.request
 from pathlib import Path
@@ -97,6 +112,12 @@ from datetime import datetime
 folder, playlist_url, ytdlp, ff_profile, album_override, no_cover, no_year, dry = sys.argv[1:]
 no_cover = int(no_cover); no_year = int(no_year); dry = int(dry)
 
+# tuning from env
+CHUNK_SIZE = int(os.environ.get("PAWTAG_CHUNK_SIZE", "20"))
+CHUNK_TIMEOUT = int(os.environ.get("PAWTAG_CHUNK_TIMEOUT", "40"))
+SOCKET_TIMEOUT = os.environ.get("PAWTAG_SOCKET_TIMEOUT", "15")
+RETRIES = os.environ.get("PAWTAG_RETRIES", "1")
+
 def log(m): print(m, flush=True)
 def run(cmd, timeout=None):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -104,7 +125,7 @@ def run(cmd, timeout=None):
         raise RuntimeError((p.stderr or '').strip() or "command failed")
     return p.stdout
 
-# Cache
+# ---------- cache ----------
 CACHE = Path(".pawtag_cache.json")
 cache = {}
 if CACHE.exists():
@@ -116,14 +137,14 @@ def save_cache():
 
 folder = Path(folder).expanduser().resolve()
 
-# Files to tag
+# ---------- collect files ----------
 rx = re.compile(r"^(\d{3})\s*-\s*(.+)\.(mp3|m4a)$", re.IGNORECASE)
 files = sorted([p for p in folder.iterdir() if p.is_file() and rx.match(p.name)])
 if not files:
     log("🫥 No files matching 'NNN - *.mp3/m4a'."); sys.exit(0)
 log(f"🔍 Found {len(files)} file(s) to process.")
 
-# --- Get playlist mapping with fallbacks ---
+# ---------- playlist mapping with fallbacks ----------
 log("📖 Fetching playlist JSON once (-J)…")
 def ytdlp_json_with_timeout(args, timeout=25):
     out = run(args, timeout=timeout)
@@ -185,7 +206,7 @@ else:
 
 print("="*72 + f"\n🎵 Now tagging album: {album}\n" + "="*72)
 
-# --- Build list + what's needed ---
+# ---------- build worklist ----------
 file_items = []  # (path, idx, ext, body)
 for f in files:
     m = rx.match(f.name); idx = int(m.group(1)); body = m.group(2); ext = m.group(3).lower()
@@ -202,29 +223,36 @@ for _, idx, _, _ in file_items:
 
 log(f"🗂️  Cache: {len(cache)} entries | Need fetch: {len(needed)}")
 
-# --- BULK METADATA FETCH (fast) ---
-def bulk_fetch(urls, client, use_cookies=True, timeout=60):
+# ---------- CHUNKED BULK METADATA FETCH ----------
+def chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
+
+def bulk_fetch_chunk(urls, client, use_cookies=True, timeout=CHUNK_TIMEOUT):
     if not urls: return {}
-    fd, listfile = tempfile.mkstemp(prefix="pawtag_urls_", suffix=".txt")
-    os.close(fd)
+    fd, listfile = tempfile.mkstemp(prefix="pawtag_urls_", suffix=".txt"); os.close(fd)
     Path(listfile).write_text("\n".join(urls), encoding="utf-8")
-    cmd = [ytdlp,
-           "--force-ipv4",
-           "--extractor-args", f"youtube:player_client={client}",
-           "--ignore-config",
-           "--no-warnings",
-           "--no-playlist",
-           "--no-download",
-           "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(upload_date)s\t%(thumbnail)s",
-           "--batch-file", listfile]
+    cmd = [
+        ytdlp,
+        "--force-ipv4",
+        "--extractor-args", f"youtube:player_client={client}",
+        "--ignore-config",
+        "--no-warnings",
+        "--no-playlist",
+        "--no-download",
+        "--socket-timeout", str(SOCKET_TIMEOUT),
+        "--retries", str(RETRIES),
+        "--print", "%(id)s\t%(title)s\t%(uploader)s\t%(upload_date)s\t%(thumbnail)s",
+        "--batch-file", listfile
+    ]
     if use_cookies:
         cmd[1:1] = ["--cookies-from-browser", f"firefox:{ff_profile}"]
-    out = ""
     try:
         out = run(cmd, timeout=timeout)
     finally:
         try: os.remove(listfile)
         except Exception: pass
+
     result = {}
     for line in out.splitlines():
         parts = line.strip().split("\t")
@@ -238,36 +266,46 @@ def bulk_fetch(urls, client, use_cookies=True, timeout=60):
             }
     return result
 
-remaining = set(needed)
+remaining = [vid for vid in needed]
 attempts = [
     ("android", True),
     ("tvhtml5", True),
+    ("ios", True),
     ("web", True),
     ("android", False),
+    ("tvhtml5", False),
+    ("ios", False),
     ("web", False),
 ]
+
 for client, use_cookies in attempts:
     if not remaining:
         break
-    urls = [f"https://www.youtube.com/watch?v={vid}" for vid in remaining]
-    try:
-        chunk = bulk_fetch(urls, client=client, use_cookies=use_cookies, timeout=60)
-        for vid, data in chunk.items():
-            cache[vid] = data
-        remaining -= set(chunk.keys())
-        if chunk:
-            print(f"   ✓ bulk {client} ({'cookies' if use_cookies else 'no-cookies'}): {len(chunk)}")
-    except Exception as e:
-        print(f"   ⚠️ bulk {client} ({'cookies' if use_cookies else 'no-cookies'}) failed: {e}")
+    got_this_round = set()
+    print(f"   → bulk pass client={client} cookies={'on' if use_cookies else 'off'}; {len(remaining)} to try...")
+    for batch in chunked(remaining, CHUNK_SIZE):
+        urls = [f"https://www.youtube.com/watch?v={vid}" for vid in batch]
+        try:
+            chunk = bulk_fetch_chunk(urls, client=client, use_cookies=use_cookies)
+            for vid, data in chunk.items():
+                cache[vid] = data
+                got_this_round.add(vid)
+        except Exception as e:
+            print(f"      ⚠️ chunk failed ({len(batch)} items): {e}")
+    if got_this_round:
+        print(f"   ✓ {len(got_this_round)} items via {client} ({'cookies' if use_cookies else 'no-cookies'})")
+        remaining = [v for v in remaining if v not in got_this_round]
 
-if remaining:
-    print(f"   ⚠️ {len(remaining)} item(s) still missing metadata; will tag using filename fallbacks.")
 # persist cache
 try:
     CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 except Exception:
     pass
 
+if remaining:
+    print(f"   ⚠️ {len(remaining)} item(s) still missing metadata; will tag using filename fallbacks.")
+
+# ---------- utility ----------
 def dl_thumb(u):
     if not u or no_cover: return None
     try:
@@ -276,7 +314,6 @@ def dl_thumb(u):
         return path
     except Exception: return None
 
-# Taggers
 def tag_mp3(path, meta, cover):
     from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TRCK, TDRC, COMM
     try: tags = ID3(path)
@@ -308,26 +345,24 @@ def tag_m4a(path, meta, cover):
         a["covr"]=[MP4Cover(data, imageformat=MP4Cover.FORMAT_JPEG)]
     a.save()
 
-# Filename fallback parser
 def parse_artist_title(name_body):
     parts = [s.strip() for s in name_body.split(" - ", 1)]
     if len(parts) == 2: return parts[0], parts[1]
     return None, name_body
 
-# Tag loop
-for f in file_items:
-    path, idx, ext, body = f
+# ---------- tag loop ----------
+for path, idx, ext, body in file_items:
     ent = idx_map.get(idx) or {}
     vid = ent.get("id")
     url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
     data = cache.get(vid, {}) if vid else {}
 
-    title  = data.get("title") or ent.get("yt_title") or None
-    artist = data.get("uploader") or None
+    title  = data.get("title") or ent.get("yt_title")
+    artist = data.get("uploader")
     if title is None or artist is None:
         a2, t2 = parse_artist_title(body)
-        title  = title  or t2
-        artist = artist or (a2 or "Unknown")
+        if title is None:  title = t2
+        if artist is None: artist = a2 or "Unknown"
 
     year = None
     if not no_year:
@@ -340,7 +375,7 @@ for f in file_items:
 
     print(f"[{idx:03d}] {path.name}")
     print(f"      title:  {title}")
-    print(f"      artist:{' ' if artist else ''}{artist if artist else 'Unknown'}")
+    print(f"      artist: {artist}")
     print(f"      album:  {album}")
     print(f"      track#: {idx}")
     print(f"      year:   {year if year is not None else ('(skipped)' if no_year else 'unknown')}")
