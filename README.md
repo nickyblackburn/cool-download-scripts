@@ -3,4 +3,4 @@
 *a repo for all my cool downloa scripts*
 
 ## Whats included 
-1. youtube playlist downloader -> mp3's
+1. youtube playlist downloader -> mp3's hit ctrl c once when u have the script running to download using the working encoding
