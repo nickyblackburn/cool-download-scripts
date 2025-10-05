@@ -1,4 +1,4 @@
-# 🎶 PawDownloaders  
+# 🎶 PawDownloaders / MISC Scripts  
 **by Nicky Blackburn 🐾**  
 Simple, reliable shell scripts for downloading and tagging music from **YouTube** and **SoundCloud** — built for Paw OS.  
 
